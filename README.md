@@ -174,6 +174,45 @@ At runtime, communication between a web page and Zotero Desktop is a two-hop pip
 
 Communication with Zotero Desktop is connector-initiated: Zotero Desktop does not arbitrarily invoke extension code. The connector controls request timing, request payloads, and compatibility checks before acting on responses.
 
+## How paper PDF links are detected
+
+PDF detection happens in multiple layers so the connector can handle direct PDF pages, embedded PDF frames, and
+download-style attachment links.
+
+### 1) Response-header detection for page/frame loads
+
+- `src/browserExt/webRequestIntercept.js` inspects `headersReceived` events for `main_frame` and `sub_frame` requests.
+- `offerSavingPDFInFrame()` checks `content-type` and treats `application/pdf` in subframes as a PDF candidate.
+- Matching frames trigger `Zotero.Connector_Browser.onPDFFrame(url, frameId, tabId)` asynchronously.
+
+### 2) Translator-first arbitration
+
+- `src/browserExt/background.js` receives translator results in `onTranslators()` and records `isPDF` when
+  `contentType == 'application/pdf'`.
+- `onPDFFrame()` only sets PDF mode when no translators are already selected for that tab, so site translators keep
+  priority over generic PDF saving.
+
+### 3) Firefox/CSP fallback (save without injected progress window)
+
+- `src/browserExt/saveWithoutProgressWindow.js` also watches `headersReceived` and marks pages as uninjectable for:
+  - Firefox PDF contexts (`application/pdf`)
+  - Firefox PDF viewer edge case: `application/octet-stream` + URL ending in `.pdf` + `main_frame`
+  - CSP sandbox pages without `allow-scripts`
+- In these cases, saving is started from the background page via `Zotero.Utilities.saveWithoutProgressWindow()`.
+
+### 4) Attachment-link monitoring (download-style PDF links)
+
+- `src/browserExt/browserAttachmentMonitor/browserAttachmentMonitor.js` adds temporary tab-scoped rules/listeners.
+- A link is treated as an attachment candidate when response headers indicate either:
+  - `content-disposition: attachment`, or
+  - `content-type` including `application/pdf` (also `application/epub+zip`)
+- On match, the request is redirected to an internal monitor page to confirm load success and continue attachment save flow.
+
+### 5) Safari injected detection fallback
+
+- Safari cannot rely on the same background content-type checks, so `src/common/inject/pageSaving.js` checks
+  `document.contentType` in injected context and calls `onPDFFrame()` for non-top PDF frames when no translators are found.
+
 ## Contact
 
 If you have any questions about developing Zotero Connectors you can join the discussion in the
