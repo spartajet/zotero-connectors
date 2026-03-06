@@ -135,6 +135,84 @@ The background process registers message listeners in [*messaging.js*](https://g
 The injected scripts monkey-patch methods in *messaging_injected.js*([BrowserExt](https://github.com/zotero/zotero-connectors/blob/e1a16c8ad2e17c6893554c3f376384e18182202d/src/browserExt/messaging_inject.js)/[Safari](https://github.com/zotero/zotero-connectors/blob/e1a16c8ad2e17c6893554c3f376384e18182202d/src/safari/messaging_inject.js))
 `Zotero.Messaging` class also provides a way to send messages to the background process and add message listeners.
 
+## Connector ↔ Zotero communication flow
+
+At runtime, communication between a web page and Zotero Desktop is a two-hop pipeline:
+
+1. Injected scripts (tab/frame context) call `Zotero.<Namespace>.<method>()`
+2. The call is forwarded to the extension background script via `Zotero.Messaging`
+3. The background script calls Zotero Desktop over HTTP using `Zotero.Connector.callMethod()`
+
+### Runtime initialization
+
+- Global/background initialization happens in `src/common/zotero.js` via `Zotero.initGlobal()`, which initializes messaging and preferences.
+- Page/injected initialization happens via `Zotero.initInject()`, which prepares message stubs and resolves `Zotero.initDeferred` when ready.
+
+### Transport and protocol details
+
+- Desktop requests are sent to `connector.url` (default `http://127.0.0.1:23119/`) with endpoint `connector/<method>`.
+- Requests are JSON over HTTP POST in `src/common/connector.js`.
+- Connector-specific headers include `X-Zotero-Version` and `X-Zotero-Connector-API-Version`.
+- Browser-side RPC between injected and background contexts is implemented in:
+  - `src/common/messaging.js`
+  - `src/browserExt/messaging_inject.js` (Chrome/Firefox/Edge)
+  - `src/safari/messaging_global.js` and `src/safari/messaging_inject.js` (Safari)
+
+### Success/failure behavior
+
+- HTTP 2xx/3xx marks Zotero Desktop as online.
+- Status `0` (network/connect failure) marks Zotero Desktop as offline.
+- Status `412` indicates an incompatible standalone version and triggers dedicated handling.
+- If Desktop is unavailable, item saving can fall back to zotero.org APIs (`src/common/api.js`).
+
+### Browser-specific notes
+
+- Chrome Manifest V3 includes a dedicated message-iframe bridge (`src/browserExt/chromeMessageIframe`) to avoid extension message size limits for large payloads.
+- Safari messaging uses request IDs and response callbacks in the native bridge layer.
+
+### Directionality and trust model
+
+Communication with Zotero Desktop is connector-initiated: Zotero Desktop does not arbitrarily invoke extension code. The connector controls request timing, request payloads, and compatibility checks before acting on responses.
+
+## How paper PDF links are detected
+
+PDF detection happens in multiple layers so the connector can handle direct PDF pages, embedded PDF frames, and
+download-style attachment links.
+
+### 1) Response-header detection for page/frame loads
+
+- `src/browserExt/webRequestIntercept.js` inspects `headersReceived` events for `main_frame` and `sub_frame` requests.
+- `offerSavingPDFInFrame()` checks `content-type` and treats `application/pdf` in subframes as a PDF candidate.
+- Matching frames trigger `Zotero.Connector_Browser.onPDFFrame(url, frameId, tabId)` asynchronously.
+
+### 2) Translator-first arbitration
+
+- `src/browserExt/background.js` receives translator results in `onTranslators()` and records `isPDF` when
+  `contentType == 'application/pdf'`.
+- `onPDFFrame()` only sets PDF mode when no translators are already selected for that tab, so site translators keep
+  priority over generic PDF saving.
+
+### 3) Firefox/CSP fallback (save without injected progress window)
+
+- `src/browserExt/saveWithoutProgressWindow.js` also watches `headersReceived` and marks pages as uninjectable for:
+  - Firefox PDF contexts (`application/pdf`)
+  - Firefox PDF viewer edge case: `application/octet-stream` + URL ending in `.pdf` + `main_frame`
+  - CSP sandbox pages without `allow-scripts`
+- In these cases, saving is started from the background page via `Zotero.Utilities.saveWithoutProgressWindow()`.
+
+### 4) Attachment-link monitoring (download-style PDF links)
+
+- `src/browserExt/browserAttachmentMonitor/browserAttachmentMonitor.js` adds temporary tab-scoped rules/listeners.
+- A link is treated as an attachment candidate when response headers indicate either:
+  - `content-disposition: attachment`, or
+  - `content-type` including `application/pdf` (also `application/epub+zip`)
+- On match, the request is redirected to an internal monitor page to confirm load success and continue attachment save flow.
+
+### 5) Safari injected detection fallback
+
+- Safari cannot rely on the same background content-type checks, so `src/common/inject/pageSaving.js` checks
+  `document.contentType` in injected context and calls `onPDFFrame()` for non-top PDF frames when no translators are found.
+
 ## Contact
 
 If you have any questions about developing Zotero Connectors you can join the discussion in the
